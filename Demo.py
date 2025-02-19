@@ -1,96 +1,171 @@
 import os
 import warnings
+import logging
+import argparse
+from dataclasses import dataclass
+from typing import Optional
+
 import numpy as np
 import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+
+from utils import (
+    seamLessClone, load_images, gaussian_mean, getFlowMaskGlobal,
+    stabilize_GPU_optimized, computePseudoCn2V2, load_and_predict
+)
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 warnings.filterwarnings("ignore")
-from utils import seamLessClone, load_images, gaussian_mean, getFlowMaskGlobal, stabilize_GPU_optimized, computePseudoCn2V2, load_and_predict
 
-# Configuration Settings
-doStabilize = True                  # Enable or disable image stabilization (True to enable stabilization)
-ProcessNumberOfFrames = 100         # Number of frames to process from the input images
-resizeFactor = 1                    # Factor to resize images (2 implies downsizing by half)
-MaxStb = 50                         # Maximum allowed pixel shift for image stabilization
-path = 'Input/Single_Car/*.png'     # Path to input images (format to ensure compatibility with glob)
-savePath = 'Output/Single_Car/'     # Path to save output images
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-restormer_weight_path = 'PretrainedModel/restormer_ASUSim_trained.pth'
+@dataclass
+class Config:
+    """Default configuration settings"""
+    do_stabilize: bool = True
+    process_frames: int = 100
+    resize_factor: int = 1
+    max_stb: int = 50
+    input_path: str = 'Input/Single_Car/*.png'
+    save_path: str = 'Output/Single_Car/'
+    model_path: str = 'PretrainedModel/restormer_ASUSim_trained.pth'
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    kernel_spatial_size: int = 20
 
-# Load images
-imgTensor = load_images(path,  ResizeFactor=resizeFactor)
-print(f'Loaded {len(imgTensor)} frames')
-imgTensor = imgTensor[:ProcessNumberOfFrames]
+def parse_args() -> argparse.Namespace:
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(description='Turbulence Segmentation and Restoration')
+    parser.add_argument('--input', type=str, help='Input path (e.g., Input/sniper/*.png)')
+    parser.add_argument('--output', type=str, help='Output directory path')
+    parser.add_argument('--frames', type=int, help='Number of frames to process')
+    parser.add_argument('--resize', type=float, help='Resize factor')
+    parser.add_argument('--no-stabilize', action='store_true', help='Disable stabilization')
+    parser.add_argument('--model', type=str, help='Path to pretrained model')
+    parser.add_argument('--max-stb', type=int, help='Maximum stabilization pixels')
+    return parser.parse_args()
 
-# Compute pseudo Cn2 for image quality and stabilization
-pseudoCn2 = computePseudoCn2V2(imgTensor)
-if doStabilize:
-    imgTensor, x_list, y_list = stabilize_GPU_optimized(imgTensor, MaxStb=50)
-pseudoCn2 = computePseudoCn2V2(imgTensor)
-pseudoCn2 = (pseudoCn2**0.8) * 1.3
+@torch.no_grad()
+def process_batch(img_tensor: torch.Tensor, config: Config) -> torch.Tensor:
+    """Process a batch of images"""
+    # Compute pseudo Cn2 and stabilize if enabled
+    pseudo_cn2 = computePseudoCn2V2(img_tensor)
+    if config.do_stabilize:
+        img_tensor, _, _ = stabilize_GPU_optimized(img_tensor, MaxStb=config.max_stb)
+    pseudo_cn2 = (computePseudoCn2V2(img_tensor)**0.8) * 1.3
 
-# Generate global segmentation masks
-GlobalSegMaskList = getFlowMaskGlobal(imgTensor, n=5, ThMagnify=1.5)
+    # Generate masks
+    masks = getFlowMaskGlobal(img_tensor, n=5, ThMagnify=1.5)
+    mask_tensor = torch.tensor(np.array(masks), dtype=torch.float, device=config.device)
+    mask_tensor = rearrange(mask_tensor, 'n h w -> 1 1 n h w')
 
-# Prepare mask tensor for 3D convolution
-MaskTensor = torch.tensor(np.array(GlobalSegMaskList), dtype=torch.float).to(device)    # [N, H, W]
-MaskTensor = rearrange(MaskTensor, 'n h w -> 1 1 n h w')                                # [1, 1, N, H, W]
+    # Process masks
+    kernel_size = [int(pseudo_cn2*2+1), config.kernel_spatial_size, config.kernel_spatial_size]
+    kernel_size = [k + 1 if k % 2 == 0 else k for k in kernel_size]
+    kernel = torch.ones(kernel_size, device=config.device)
+    kernel = rearrange(kernel, 'd h w -> 1 1 d h w')
 
-# Define kernel
-kernel_size = [int(pseudoCn2*2+1), 20, 20]      # Adaptive Temporal blur + spatial blur on 20x20 pixels
-kernel_size = [k + 1 if k % 2 == 0 else k for k in kernel_size]
-kernel = torch.ones(kernel_size, device=MaskTensor.device)
-kernel = rearrange(kernel, 'd h w -> 1 1 d h w')                                        # [1, 1, D, H, W]
+    padding = [k // 2 for k in kernel_size]
+    dilated_mask = F.conv3d(mask_tensor, kernel, padding=padding)
+    masks = rearrange((dilated_mask > 0).float(), '1 1 n h w -> n h w')
+    masks = repeat(masks, 'n h w -> n c h w', c=3)
 
-# Apply 3D convolution with padding
-padding = [k // 2 for k in kernel_size]
-dilated_mask = F.conv3d(MaskTensor, kernel, padding=padding)
-Masks = rearrange((dilated_mask > 0).float(), '1 1 n h w -> n h w')
-Masks = repeat(Masks, 'n h w -> n c h w', c=3)
-
-# Apply adaptive Gaussian weighting for temporal blurring on the images
-Gaussian_ImgCube = gaussian_mean(imgTensor.to(device), Masks, sigma=pseudoCn2)
+    # Process images
+    gaussian_img = gaussian_mean(img_tensor, masks, sigma=pseudo_cn2)
+    return gaussian_img, masks
 
 
-# Prepare background and foreground image cubes
-BG_NHWC = rearrange(Gaussian_ImgCube, 'n c h w -> n h w c')[:ProcessNumberOfFrames].cpu().numpy()
-FG_NHWC = rearrange(imgTensor, 'n c h w -> n h w c')[:ProcessNumberOfFrames].cpu().numpy()
-Masks = np.array(Masks.cpu().numpy())[:ProcessNumberOfFrames]
+def save_results(processed: torch.Tensor, config: Config) -> None:
+    """Save processed images"""
+    os.makedirs(config.save_path, exist_ok=True)
+    logger.info(f'Saving results to {config.save_path}')
 
-# Combine background and foreground images
-N, H, W, C = len(BG_NHWC), BG_NHWC[0].shape[0], BG_NHWC[0].shape[1], BG_NHWC[0].shape[2]
-CB_NHWC = torch.zeros((N, H, W, C))
-Masks3Ch = rearrange(Masks, 'n c h w -> n h w c')
-Masks3Ch = (Masks3Ch * 255).astype(np.uint8)
-
-for i in tqdm(range(N)):
-    BG = (BG_NHWC[i]*255).astype(np.uint8)
-    FG = (FG_NHWC[i]*255).astype(np.uint8)
-    CB = seamLessClone(BG, FG, Masks3Ch[i, :, :, 0])
-    CB_NHWC[i] = torch.tensor(CB)
-
-CB_NHWC = CB_NHWC/255
-
-os.makedirs(savePath, exist_ok=True)
-
-# Save processed images
-for i in range(len(CB_NHWC)):
-    image_np = CB_NHWC[i].cpu().numpy()
-    if image_np.max() <= 1.0:
-        image_np = (image_np * 255).astype(np.uint8)
-    
-    try:
-        output = load_and_predict(image_np, restormer_weight_path)
-        plt.imsave(f'{savePath}/{str(i).zfill(4)}_Restored_Enhanced.jpg', output)
-    except:
-        # Check if the pretrained model is available
-        assert os.path.exists(restormer_weight_path), "Pretrained model not found."
-
-        # Check available GPU VRAM is sufficient for Restormer
-        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
-        print(f'Available GPU VRAM: {gpu_memory:.2f} GB is not enough for Restormer. Please use a GPU with at least 24GB VRAM.')
+    for i in tqdm(range(len(processed)), desc="Saving images"):
+        # Get image and ensure it's on CPU
+        image = processed[i].cpu()
         
-        # Save the image without Restormer
-        plt.imsave(f'{savePath}/{str(i).zfill(4)}_JustRestored_NotEnhanced.jpg', image_np)
+        # Convert to numpy and ensure correct dimensions (H,W,C)
+        image_np = image.numpy()
+        
+        # Rearrange dimensions if needed (from C,H,W to H,W,C)
+        if image_np.shape[0] == 3:
+            image_np = np.transpose(image_np, (1, 2, 0))
+            
+        # Ensure values are in correct range
+        if image_np.max() <= 1.0:
+            image_np = (image_np * 255).astype(np.uint8)
+        else:
+            image_np = image_np.astype(np.uint8)
+        
+        try:
+            # Try to enhance the image
+            output = load_and_predict(image_np, config.model_path)
+            plt.imsave(f'{config.save_path}/{str(i).zfill(4)}_Enhanced.jpg', 
+                      output, 
+                      format='jpg')
+        except Exception as e:
+            logger.warning(f"Failed to enhance image {i}: {str(e)}")
+            # Save unenhanced image
+            try:
+                plt.imsave(f'{config.save_path}/{str(i).zfill(4)}_NotEnhanced.jpg', 
+                          image_np,
+                          format='jpg')
+            except Exception as save_error:
+                logger.error(f"Failed to save unenhanced image {i}: {str(save_error)}")
+                # Try one last time with dimension check
+                if len(image_np.shape) == 3 and image_np.shape[2] != 3:
+                    image_np = np.transpose(image_np, (1, 2, 0))
+                plt.imsave(f'{config.save_path}/{str(i).zfill(4)}_NotEnhanced.jpg',
+                          image_np,
+                          format='jpg')
+
+def main():
+    """Main execution function"""
+    # Load configuration
+    args = parse_args()
+    config = Config()
+    
+    # Update config with CLI arguments
+    if args.input:
+        config.input_path = args.input
+    if args.output:
+        config.save_path = args.output
+    if args.frames:
+        config.process_frames = args.frames
+    if args.resize:
+        config.resize_factor = args.resize
+    if args.no_stabilize:
+        config.do_stabilize = False
+    if args.model:
+        config.model_path = args.model
+    if args.max_stb:
+        config.max_stb = args.max_stb
+
+    # Check GPU requirements
+    if torch.cuda.is_available():
+        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        if gpu_memory < 24.0:
+            logger.warning(f'Available GPU VRAM: {gpu_memory:.2f} GB might not be sufficient')
+
+    try:
+        # Load and process images
+        logger.info(f'Loading images from {config.input_path}')
+        img_tensor = load_images(config.input_path, ResizeFactor=config.resize_factor)
+        img_tensor = img_tensor[:config.process_frames]
+        logger.info(f'Processing {len(img_tensor)} frames')
+
+        # Process images in batches
+        processed_imgs, masks = process_batch(img_tensor, config)
+        
+        # Save results
+        save_results(processed_imgs, config)
+        logger.info('Processing completed successfully')
+
+    except Exception as e:
+        logger.error(f"Processing failed: {str(e)}", exc_info=True)
+        raise
+
+if __name__ == "__main__":
+    main()
