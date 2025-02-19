@@ -20,39 +20,71 @@ cd Turb-Seg-Res
 pip install -r requirements.txt
 python Demo.py
 ```
+
 ## Contributions
 - **High Focal Length Video Stabilization:** Stabilizes videos captured by high focal length cameras, which are highly sensitive to vibrations.
 - **Turbulence Video Simulation:** Introduces a novel tilt-and-blur video simulator based on simplex noise for generating plausible turbulence effects with temporal coherence.
 - **Unsupervised Motion Segmentation:** Efficiently segments dynamic scenes affected by atmospheric turbulence, distinguishing between static and dynamic components.
 
 ## Usage (Demo.py)
-The main script for running the demo is `Demo.py`. It processes a set of input images, applies stabilization, and saves the output images.
+The main script `Demo.py` processes input images with stabilization and enhancement options. You can run it with various command-line arguments:
 
+### Basic Usage
 ```sh
 python Demo.py
 ```
 
-### Configuration
-The following configuration settings can be adjusted in `Demo.py`:
+### Command Line Arguments
+```sh
+python Demo.py [OPTIONS]
 
-- `doStabilize`: Enable or disable image stabilization.
-- `ProcessNumberOfFrames`: Number of frames to process from the input images.
-- `resizeFactor`: Factor to resize images.
-- `MaxStb`: Maximum allowed pixel shift for image stabilization.
-- `path`: Path to input images.
-- `savePath`: Path to save output images.
-
-## Additional Resources
-- [![QuickTurbSim](https://img.shields.io/badge/QuickTurbSim-GitHub-blue)](https://github.com/Riponcs/QuickTurbSim): A repository for simulating atmospheric turbulence effects on images using 3D simplex noise and Gaussian blur.
-
-## Train the Model:
-Run this command to autometically download and prepare the dataset:
-
+Options:
+  --input PATH        Input path (e.g., Input/sniper/*.png)
+  --output PATH       Output directory path
+  --frames NUMBER     Number of frames to process
+  --resize FACTOR     Resize factor for input images
+  --no-stabilize     Disable image stabilization
+  --model PATH       Path to pretrained model
+  --max-stb NUMBER   Maximum stabilization pixels
 ```
+
+### Examples
+```sh
+# Process specific input folder
+python Demo.py --input "Input/custom/*.png" --output "Output/custom"
+
+# Process 50 frames with resizing
+python Demo.py --frames 50 --resize 0.5
+
+# Process without stabilization
+python Demo.py --no-stabilize
+
+# Use custom model
+python Demo.py --model "path/to/custom/model.pth"
+```
+
+### Default Configuration
+If no arguments are provided, the script uses these default settings:
+- Input Path: `Input/Single_Car/*.png`
+- Output Path: `Output/Single_Car/`
+- Number of Frames: 100
+- Stabilization: Enabled
+- Resize Factor: 1
+- Model Path: `PretrainedModel/restormer_ASUSim_trained.pth`
+- Max Stabilization: 50 pixels
+
+### Hardware Requirements
+- GPU with at least 24GB VRAM recommended
+- Warning will be shown if available GPU memory is insufficient
+
+## Train the Model
+Prepare the dataset:
+```sh
 python TrainRestormer/preapareDataset.py
 ```
-Now, Use this command to train the model: 
-```
+
+Train the model:
+```sh
 python TrainRestormer/main.py
 ```
 
@@ -65,3 +97,7 @@ If you find this work useful, please cite our CVPR 2024 paper:
     booktitle = {Proceedings of the IEEE/CVF conference on computer vision and pattern recognition},
     year      = {2024},
 }
+```
+
+## Additional Resources
+- [![QuickTurbSim](https://img.shields.io/badge/QuickTurbSim-GitHub-blue)](https://github.com/Riponcs/QuickTurbSim): A repository for simulating atmospheric turbulence effects on images using 3D simplex noise and Gaussian blur.
